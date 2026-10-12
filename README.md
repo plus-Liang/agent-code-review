@@ -50,6 +50,8 @@ flowchart LR
 ## 用法
 
 ```bash
+python -m venv .venv                 # 建议用虚拟环境，依赖装在哪由你来定
+. .venv/bin/activate                 # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 export DEEPSEEK_API_KEY=...          # 或 LLM_API_KEY / OPENAI_API_KEY
 python cli.py --base main --head test-branch
@@ -59,8 +61,8 @@ python cli.py --base main --head test-branch
 
 LLM 走 OpenAI 兼容接口，默认 `https://api.deepseek.com/v1` + `deepseek-chat`。
 
-> 本机说明：`site-packages` 不可写，`unidiff` 以仓库本地 `.deps/` 形式提供，
-> `cli.py` / 测试会在导入前把它加进 `sys.path`。`.deps/` 不入库。
+> 依赖一律来自 `pip install -r requirements.txt` 装到的环境；代码里没有任何 `sys.path`
+> 注入，也不读仓库内的依赖目录（确保 clone 后行为一致）。
 
 ## 测试
 

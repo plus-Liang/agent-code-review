@@ -10,18 +10,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-# 本机无法写入 site-packages，unidiff 以仓库本地 .deps 形式提供（见 README）。
-for extra in (ROOT / ".deps", ROOT):
-    if extra.is_dir() and str(extra) not in sys.path:
-        sys.path.insert(0, str(extra))
-
-from core.graph import build_graph  # noqa: E402
-from findings.locate import locate_findings  # noqa: E402
-from findings.schema import findings_to_json  # noqa: E402
+from core.graph import build_graph
+from findings.locate import locate_findings
+from findings.schema import findings_to_json
 
 
 def build_parser() -> argparse.ArgumentParser:
