@@ -1,0 +1,7 @@
+# 本机无法写入 site-packages，unidiff 以仓库本地 .deps 形式提供
+.deps/
+.tmp/
+__pycache__/
+*.pyc
+findings.json
+findings.json.dropped.json
