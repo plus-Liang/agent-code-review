@@ -25,21 +25,32 @@ from findings.schema import ChangeSet
 DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 DEFAULT_MODEL = "deepseek-chat"
 
-SYSTEM_PROMPT = """你是一名严格但务实的资深代码审查员。你会收到一个文件的 diff。
+SYSTEM_PROMPT = """你是一名严格但务实的资深代码审查员，审查的是一个真实 PR 里改动的 production 代码。
 
-只报告**真实存在**的问题：逻辑错误、边界条件、异常处理缺失、安全问题、
-并发/资源泄漏、明显的性能反模式。不要报告纯粹的命名/格式偏好。
+只报这三类问题：
+- 安全漏洞：注入、路径穿越、鉴权缺失、敏感信息泄露、不安全反序列化/eval
+- 正确性缺陷：逻辑错误、边界条件、空值/除零、并发竞态、状态不一致
+- 可靠性问题：资源泄漏、异常被吞、缺少超时/重试、错误的平台假设
+
+以下**不算问题，一律不要报**：
+- 样式、格式、缩进、命名、注释措辞、代码优雅度、"建议重构"
+- CSS 变量、颜色值、对比度、主题/视觉微调
+- 测试文件里的任何内容（路径含 tests/、__tests__/，或文件名形如 test_* / *.test.* / *_test.*）
+- 纯文档、CHANGELOG、README、模板文本
+
+严重级门槛：只允许 high 或 medium，不允许 low。拿不准就不要报。
 
 输出必须是 JSON，格式：
-{"findings": [{"existing_code": "...", "message": "...", "severity": "high|medium|low", "category": "bug|security|performance|style|maintainability|other"}]}
+{"findings": [{"existing_code": "...", "message": "...", "severity": "high|medium", "category": "bug|security|performance|reliability"}]}
 
 硬性要求：
 1. existing_code 必须**逐字照抄**变更后文件中的原始代码行（可以有 1~5 行），
    保留原始缩进和标点，不要改写、不要加行号、不要加 +/- 前缀。
 2. 绝对不要输出行号、不要输出 "line 12" 这类文字——行号由外部工具根据
    existing_code 自行定位。
-3. 同一条问题不要拆成多条；没有把握就少报。
-4. 没有问题就返回 {"findings": []}。
+3. 同一处问题只报一次；相邻几行属于同一个问题的，合并成一条。
+4. 每个文件最多 3 条，整次审查最多 8 条，超出就只留最严重的。
+5. 没有问题就返回 {"findings": []}。
 """
 
 USER_PROMPT_TEMPLATE = """文件：{file}

@@ -96,6 +96,19 @@ python -m eval.run_eval --corpus D:\reviewbench-data\corpus\test \
 > 它便宜、可复现，适合做回归和相对比较；对官方口径的绝对值没有可比性，别拿它对外报数。
 > 冒烟自检：拿 golden 当预测输入，本实现给出 P=R=F1=1.000。
 
+## 降误报（第三阶段）
+
+两道防线，都不碰 resolver：
+
+1. **收紧审查范围（prompt）**：只报 production 代码的安全 / 正确性 / 可靠性问题；显式排除
+   样式 nitpick、CSS 变量、测试文件、纯文档；severity 只允许 high/medium；每个文件最多 3 条、
+   整次最多 8 条。
+2. **后处理（`findings/postprocess.py`）**：同文件 + 行区间重叠去重 → 丢 low/info →
+   整次最多 `--max-findings`（默认 10）条，超出按严重级截断。只做减法，不改行号。
+
+全量 25 题前后对比（同 23 题口径）：P 0.308→0.444，R 0.346→0.178，F1 0.326→0.254，
+FP 245→70。误报大幅下降，但"少报"把真问题也压掉了，recall 腰斩——下一步的瓶颈在召回而非精度。
+
 ## MVP 的边界（本阶段刻意不做）
 
 - **只支持本地 diff**：`adapter/github_pr.py` 只是占位，不接 GitHub API、不接 PR 评论。

@@ -14,6 +14,7 @@ from pathlib import Path
 
 from core.graph import build_graph
 from findings.locate import locate_findings
+from findings.postprocess import postprocess
 from findings.schema import findings_to_json
 
 
@@ -32,6 +33,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-files", type=int, default=None, help="最多审查多少个文件")
     parser.add_argument(
         "--locate-level", type=int, default=1, help="定位等级，本阶段只支持 1"
+    )
+    parser.add_argument(
+        "--max-findings", type=int, default=10, help="后处理上限：每个 PR 最多输出几条（默认 10）"
     )
     parser.add_argument(
         "--dump-dropped", action="store_true", help="把定位失败的原始结论写到 <out>.dropped.json"
@@ -58,6 +62,7 @@ def main(argv=None) -> int:
     changesets = state.get("changesets") or []
     raw_findings = state.get("raw_findings") or []
     findings, dropped = locate_findings(raw_findings, changesets, level=args.locate_level)
+    findings, stats = postprocess(findings, max_findings=args.max_findings)
 
     out_path = Path(args.out)
     out_path.write_text(findings_to_json(findings), encoding="utf-8")
@@ -70,7 +75,9 @@ def main(argv=None) -> int:
     print(
         f"[agent-code-review] {args.base}...{args.head}: "
         f"{len(changesets)} 个变更文件, 模型原始结论 {len(raw_findings)} 条, "
-        f"定位成功 {len(findings)} 条, 丢弃 {len(dropped)} 条 -> {out_path}"
+        f"定位成功 {stats.input} 条, 丢弃 {len(dropped)} 条, "
+        f"后处理合并 {stats.merged_duplicates} / 低severity {stats.dropped_severity} / "
+        f"超限 {stats.dropped_over_cap} 条, 最终 {stats.kept} 条 -> {out_path}"
     )
     return 0
 
