@@ -71,12 +71,35 @@ python -m unittest discover -s tests -t .
 ```
 
 覆盖：契约 JSON 往返、diff 解析行号、1 级定位（含失败与越级）、locate 排序/丢弃、
+确定性指标（匹配/容差/一对一贪心/汇总）、golden 与预测加载、
 以及临时 git 仓库上的端到端链路（用假 LLM 客户端，不联网）。
+
+## 评估接入（第二阶段）
+
+数据集用 GitHub 官方的 [ReviewBench](https://github.com/review-bench/ReviewBench)：
+
+```bash
+git -c http.sslBackend=openssl clone --depth 1 https://github.com/review-bench/ReviewBench D:\reviewbench-data
+```
+
+- `corpus/test/` —— 25 题测试集（`test.json` 元数据 + `findings.json` golden），`golden/` 是全量 219 题。
+- 跑一题：先在镜像仓库 checkout 上生成预测，再打分。
+
+```bash
+python cli.py --base <base-sha> --head <head-sha> --repo <checkout> --out findings.json
+python -m eval.run_eval --corpus D:\reviewbench-data\corpus\test \
+    --pred findings.json --task <owner>_<repo>_<pr>-<head8> --out report.json
+```
+
+> **指标口径**：官方 matcher（`scripts/eval/matcher.ts`）用 LLM 判断两条 findings 是否
+> 「同一个问题」。`eval/metrics.py` 是**确定性代理**：同文件 + 行区间重叠（可给容差）即算命中。
+> 它便宜、可复现，适合做回归和相对比较；对官方口径的绝对值没有可比性，别拿它对外报数。
+> 冒烟自检：拿 golden 当预测输入，本实现给出 P=R=F1=1.000。
 
 ## MVP 的边界（本阶段刻意不做）
 
 - **只支持本地 diff**：`adapter/github_pr.py` 只是占位，不接 GitHub API、不接 PR 评论。
 - **只有 2 个节点**：`read_diff → review`。不做多智能体、不做角色拆分、不做自检循环。
-- **不做评估**：`eval/metrics.py`、`eval/golden_loader.py` 是占位，尚未对接 ReviewBench。
-- **只实现 1 级定位**：跨 hunk / 模糊匹配留到阶段二。
+- **只实现 1 级定位**：跨 hunk / 模糊匹配留到后面。
+- **评估只用确定性代理**，尚未接官方 LLM judge；也不做官方要求的容器化提交（AGENT_CONTRACT）。
 - **不做去重、不做修复建议、不做历史学习**。
