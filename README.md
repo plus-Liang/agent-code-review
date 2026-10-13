@@ -133,6 +133,23 @@ FP 245→70。误报大幅下降，但"少报"把真问题也压掉了，recall 
 也就是说模型引用的代码几乎总在 hunk 里，2/3 级目前是保险而不是增量。分层结果：production 层
 F1 **0.356**，skipped 层 0（分诊后这些文件根本不送审）。
 
+## 模型对照实验（第六阶段）
+
+同一套 prompt、同一套流程，只换模型（`LLM_MODEL`）跑全量 23 题（两次都能跑通的那批）：
+
+| 模型 | TOTAL F1 | production 层 P / R / F1 | production tp/fp/fn | 单题耗时中位 |
+| --- | --- | --- | --- | --- |
+| `deepseek-chat` | 0.312 | 0.455 / 0.293 / **0.356** | 75 / 90 / 181 | 22 s |
+| `deepseek-reasoner` | 0.215 | 0.385 / 0.184 / **0.249** | 47 / 75 / 209 | 200 s |
+
+结论：换"更强的推理模型"**没有**改善，反而更差（production F1 −0.107），而且慢约 9 倍
+（最长一题 52 分钟，超过 ReviewBench 官方每 PR 15 分钟的限制）。
+
+production 层 181 条漏报的分布：correctness 72、reliability 29、maintainability 26、
+security 14、testing 12、api-architecture 11、performance 9、documentation 7、accessibility 1。
+抽样看，漏报集中在**需要框架/库 API 语义**的正确性问题（reatom v2 API、MapLibre 事件时序、
+ECMAScript flag 细节），不是"模型不够聪明"能一笔带过的，更像是上下文不足。
+
 ## MVP 的边界（本阶段刻意不做）
 
 - **只支持本地 diff**：`adapter/github_pr.py` 只是占位，不接 GitHub API、不接 PR 评论。
