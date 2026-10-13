@@ -8,9 +8,12 @@
 flowchart LR
     A["git diff base...head<br/>adapter/git_diff.py"] --> B["core/diff_parser.py<br/>unidiff → ChangeSet"]
     B --> C["core/graph.py 节点1<br/>read_diff"]
-    C --> D["core/graph.py 节点2<br/>review (LLM)"]
-    D -->|"existing_code + message + severity<br/>（不含行号）"| E["findings/locate.py<br/>+ core/resolver.py 1级定位"]
-    E --> F["findings.json<br/>file + start_line + end_line"]
+    C --> T["core/graph.py 节点2<br/>triage（确定性筛文件）"]
+    T --> D["core/graph.py 节点3<br/>review (LLM)"]
+    X["core/context.py<br/>三层上下文供给"] -.->|"同文件 / 调用链 / 框架文档"| D
+    D -->|"existing_code + message + severity<br/>（不含行号）"| E["findings/locate.py<br/>+ core/resolver.py 1/2/3 级定位"]
+    E --> P["findings/postprocess.py<br/>去重 / severity / 上限"]
+    P --> F["findings.json<br/>file + start_line + end_line"]
     G["findings/schema.py<br/>ChangeSet / Finding 契约"] -.-> B
     G -.-> F
 ```
@@ -150,10 +153,56 @@ security 14、testing 12、api-architecture 11、performance 9、documentation 7
 抽样看，漏报集中在**需要框架/库 API 语义**的正确性问题（reatom v2 API、MapLibre 事件时序、
 ECMAScript flag 细节），不是"模型不够聪明"能一笔带过的，更像是上下文不足。
 
+## 上下文供给（第七阶段，核心机制）
+
+**瓶颈不在模型档位，在模型看到了什么。** 这一阶段把喂给模型的输入从"只有 diff"扩成三层，
+全部是本地确定性计算（不额外调 LLM），开关是环境变量 `ACR_CONTEXT_LAYERS`（默认 `1,2,3`，
+置 `0` 即等价于改前的纯 diff 输入）。
+
+| 层 | 做什么 | 上限 |
+| --- | --- | --- |
+| 1 同文件 | 被改文件的**非 diff 部分**：import 段、类型/类定义、被改函数之外的其它函数，按 import > 类型 > 离改动最近排序 | 100 行 |
+| 2 调用链 | 被改函数的**调用方**与**被调用方**片段各取前后 20 行；Python 走 `ast`，其它语言走正则 + 缩进/花括号配平，支持跨文件 import 解析 | 24000 字符（≈8k token） |
+| 3 框架文档 | 从 import 与 API 指纹检测框架/库，检索内置文档片段 top-3（reatom / MapLibre / React / FastAPI / Express / pytest-mock / node-postgres / Go context / .NET / GitHub Actions / Ruby gemspec 等） | 3 条 |
+
+实现在 `core/context.py`，由 `core/graph.py` 的深审节点逐文件拼装后注入 user prompt；
+模板不含 `{context}` 占位符时退回旧行为。任何一层算不出来都只是少一段文本，
+检测不到框架时第三层直接跳过——**不为上下文供给引入新的失败模式**。
+
+### 换模型 vs 补上下文
+
+同一批题、同一个模型做 A/B（`ACR_CONTEXT_LAYERS=0` vs `1,2,3`）：
+
+| 口径 | production P | R | F1 |
+| --- | --- | --- | --- |
+| `glm-4.5-air`，纯 diff | 0.364 | 0.080 | 0.131 |
+| `glm-4.5-air`，三层上下文 | **0.438** | **0.140** | **0.212** |
+| `deepseek-chat`，纯 diff（同题集参考） | 0.353 | 0.120 | 0.179 |
+
+结论：**补上下文比换更强的模型划算**。`glm-4.5-air` 加上下文后（0.212）反超
+`deepseek-chat` 纯 diff（0.179）；而第六阶段的换模型实验里，更强的 deepseek-reasoner
+反而比 deepseek-chat 低 0.107。也就是说前面那个"换模型没用"的现象，
+本质是**上下文不足**，不是模型不够聪明。
+
+代价是输入变长：同题集 prompt token 60k → 145k（×2.4，单文件最多约 5.8k），
+耗时中位 148s → 400s（×2.7，其中含有上游拥塞的放大）。
+
+> **口径说明**：这一轮用的第三方 key 只开放 `glm-4.5-air`，且 8 题里有 3 题被上游
+> 超时/限流打断，所以上表是**同一模型、同一 5 题子集**的可比结果，绝对值**不能**和
+> 前面全量 23 题的 `deepseek-chat` 基线（production F1 0.356）直接对比。
+> 子集取的是 production 层 F1 最低的 7 题，另加 1 题框架知识样本（MapLibre/reatom）。
+
+### 依赖：fastembed 是可选的
+
+第三层用 **fastembed**（默认 `BAAI/bge-small-en-v1.5`）对内置文档片段做向量检索。
+它是**可选依赖**：没装、模型下载不下来、或者嵌入失败时，`core/context.py` 会自动降级成
+IDF 加权的词法检索，第三层照常工作，**主流程完全不受影响**（每进程只尝试一次，
+不会反复卡在模型下载上）。想省掉这份依赖，把 `fastembed` 从 `requirements.txt` 删掉即可。
+
 ## MVP 的边界（本阶段刻意不做）
 
 - **只支持本地 diff**：`adapter/github_pr.py` 只是占位，不接 GitHub API、不接 PR 评论。
-- **只有 2 个节点**：`read_diff → review`。不做多智能体、不做角色拆分、不做自检循环。
-- **只实现 1 级定位**：跨 hunk / 模糊匹配留到后面。
+- **不做多智能体**：链路是 `read_diff → triage → review` 三个节点，不拆角色、不做自检循环。
+- **定位仍是"保险"不是"增量"**：1 级命中 98.9%，2/3 级（全文滑窗 / LLM 重定位）只有 0% / 0.4%。
 - **评估只用确定性代理**，尚未接官方 LLM judge；也不做官方要求的容器化提交（AGENT_CONTRACT）。
 - **不做去重、不做修复建议、不做历史学习**。

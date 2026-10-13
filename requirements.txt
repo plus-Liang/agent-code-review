@@ -1,3 +1,6 @@
 unidiff>=1.0.1
 langgraph>=0.2
 openai>=1.40
+# 可选：第三层「框架文档检索」用的本地向量模型。不装也不影响主流程——
+# core/context.py 会自动降级成 IDF 词法检索（见 README「上下文供给」一节）。
+fastembed>=0.4
