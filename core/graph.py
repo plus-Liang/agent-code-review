@@ -26,6 +26,27 @@ from findings.schema import ChangeSet
 
 DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 DEFAULT_MODEL = "deepseek-chat"
+# 单次请求超时与重试：不带超时的话，上游偶发的一次卡死会把整个 PR 拖到 SDK 默认的
+# 600 秒上限（ReviewBench 官方每 PR 只有 15 分钟），有超时+重试才跑得完。
+DEFAULT_TIMEOUT_SECONDS = 180.0
+DEFAULT_MAX_RETRIES = 3
+
+
+def _llm_timeout() -> float:
+    return float(os.environ.get("LLM_TIMEOUT") or DEFAULT_TIMEOUT_SECONDS)
+
+
+def _llm_max_retries() -> int:
+    return int(os.environ.get("LLM_MAX_RETRIES") or DEFAULT_MAX_RETRIES)
+
+
+def _new_client(api_key: str, base_url: str) -> OpenAI:
+    return OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=_llm_timeout(),
+        max_retries=_llm_max_retries(),
+    )
 
 SYSTEM_PROMPT = """你是一名严格但务实的资深代码审查员，审查的是一个真实 PR 里改动的 production 代码。
 
@@ -154,7 +175,7 @@ def review_node(state: ReviewState, client: Optional[OpenAI] = None) -> ReviewSt
             base_url=state.get("base_url"),
             model=state.get("model"),
         )
-        llm = OpenAI(api_key=config["api_key"], base_url=config["base_url"])
+        llm = _new_client(config["api_key"], config["base_url"])
         model = config["model"]
     else:
         llm = client
@@ -238,7 +259,7 @@ def make_relocator(
     """
     if client is None:
         config = resolve_llm_config(api_key=api_key, base_url=base_url, model=model)
-        llm = OpenAI(api_key=config["api_key"], base_url=config["base_url"])
+        llm = _new_client(config["api_key"], config["base_url"])
         target_model = config["model"]
     else:
         llm = client
