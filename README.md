@@ -109,6 +109,18 @@ python -m eval.run_eval --corpus D:\reviewbench-data\corpus\test \
 全量 25 题前后对比（同 23 题口径）：P 0.308→0.444，R 0.346→0.178，F1 0.326→0.254，
 FP 245→70。误报大幅下降，但"少报"把真问题也压掉了，recall 腰斩——下一步的瓶颈在召回而非精度。
 
+## 分诊与放松抑制（第四阶段）
+
+- **分诊节点**（`core/triage.py`，确定性、不调 LLM）：`read_diff → triage → review`，路径规则跳过
+  测试 / 样式 / 文档 / 锁与依赖清单 / 生成物，只对剩下的文件花模型调用。`changesets` 本身不动，
+  定位仍在全部变更文件上做，避免"跳过的文件让已有 finding 定位失败"。
+- **放松抑制**：severity 只过滤 `low`（prompt 允许标 low），删掉"拿不准别报"，单 PR 上限 10 → 20。
+
+全量（23 题同口径）：P 0.308→0.373，R 0.346→0.187，F1 0.326→0.249，FP 245→99，TP 109→59。
+两个反直觉结论：① 分诊按"只看 production"筛，但本 benchmark 有 **18% 的 golden 就在被跳过的
+文件里**（ForgeMap 15 条里 14 条是 CSS），分诊的召回损失抵掉了放松带来的收益；
+② "prompt 允许标 low + 后处理丢弃 low"自相矛盾，模型把真问题标成 low 后直接被丢掉。
+
 ## MVP 的边界（本阶段刻意不做）
 
 - **只支持本地 diff**：`adapter/github_pr.py` 只是占位，不接 GitHub API、不接 PR 评论。

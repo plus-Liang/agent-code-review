@@ -35,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--locate-level", type=int, default=1, help="定位等级，本阶段只支持 1"
     )
     parser.add_argument(
-        "--max-findings", type=int, default=10, help="后处理上限：每个 PR 最多输出几条（默认 10）"
+        "--max-findings", type=int, default=20, help="后处理上限：每个 PR 最多输出几条（默认 20）"
     )
     parser.add_argument(
         "--dump-dropped", action="store_true", help="把定位失败的原始结论写到 <out>.dropped.json"
@@ -60,6 +60,8 @@ def main(argv=None) -> int:
     )
 
     changesets = state.get("changesets") or []
+    skipped_files = state.get("skipped_files") or []
+    review_files = state.get("review_changesets") or []
     raw_findings = state.get("raw_findings") or []
     findings, dropped = locate_findings(raw_findings, changesets, level=args.locate_level)
     findings, stats = postprocess(findings, max_findings=args.max_findings)
@@ -74,8 +76,8 @@ def main(argv=None) -> int:
 
     print(
         f"[agent-code-review] {args.base}...{args.head}: "
-        f"{len(changesets)} 个变更文件, 模型原始结论 {len(raw_findings)} 条, "
-        f"定位成功 {stats.input} 条, 丢弃 {len(dropped)} 条, "
+        f"{len(changesets)} 个变更文件, 分诊后深审 {len(review_files)} 个（跳过 {len(skipped_files)}）, "
+        f"模型原始结论 {len(raw_findings)} 条, 定位成功 {stats.input} 条, 丢弃 {len(dropped)} 条, "
         f"后处理合并 {stats.merged_duplicates} / 低severity {stats.dropped_severity} / "
         f"超限 {stats.dropped_over_cap} 条, 最终 {stats.kept} 条 -> {out_path}"
     )

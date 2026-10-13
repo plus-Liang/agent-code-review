@@ -82,10 +82,11 @@ class EndToEndTest(unittest.TestCase):
         _git(self.tmp, "add", "-A")
         _git(self.tmp, "commit", "-m", "buggy change")
 
-    def test_graph_has_exactly_two_nodes(self):
+    def test_graph_has_read_diff_triage_review(self):
         graph = build_graph()
         nodes = set(graph.get_graph().nodes)
         self.assertIn("read_diff", nodes)
+        self.assertIn("triage", nodes)
         self.assertIn("review", nodes)
 
     def test_pipeline_produces_located_finding(self):

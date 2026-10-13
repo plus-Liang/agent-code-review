@@ -20,6 +20,7 @@ from langgraph.graph import END, StateGraph
 from openai import OpenAI
 
 from adapter.git_diff import get_change_sets
+from core.triage import triage
 from findings.schema import ChangeSet
 
 DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
@@ -38,10 +39,11 @@ SYSTEM_PROMPT = """你是一名严格但务实的资深代码审查员，审查�
 - 测试文件里的任何内容（路径含 tests/、__tests__/，或文件名形如 test_* / *.test.* / *_test.*）
 - 纯文档、CHANGELOG、README、模板文本
 
-严重级门槛：只允许 high 或 medium，不允许 low。拿不准就不要报。
+严重级：按真实影响标 high / medium / low。不确定严重程度时，按你认为最接近的一档标出来即可，
+不要因为不确定就省略问题——漏报比多报一条更糟。
 
 输出必须是 JSON，格式：
-{"findings": [{"existing_code": "...", "message": "...", "severity": "high|medium", "category": "bug|security|performance|reliability"}]}
+{"findings": [{"existing_code": "...", "message": "...", "severity": "high|medium|low", "category": "bug|security|performance|reliability|maintainability"}]}
 
 硬性要求：
 1. existing_code 必须**逐字照抄**变更后文件中的原始代码行（可以有 1~5 行），
@@ -49,7 +51,7 @@ SYSTEM_PROMPT = """你是一名严格但务实的资深代码审查员，审查�
 2. 绝对不要输出行号、不要输出 "line 12" 这类文字——行号由外部工具根据
    existing_code 自行定位。
 3. 同一处问题只报一次；相邻几行属于同一个问题的，合并成一条。
-4. 每个文件最多 3 条，整次审查最多 8 条，超出就只留最严重的。
+4. 每个文件最多 4 条，整次审查最多 20 条。
 5. 没有问题就返回 {"findings": []}。
 """
 
@@ -73,6 +75,8 @@ class ReviewState(TypedDict, total=False):
     model: Optional[str]
     template: Optional[str]
     changesets: List[ChangeSet]
+    review_changesets: List[ChangeSet]
+    skipped_files: List[Dict[str, str]]
     raw_findings: List[Dict[str, Any]]
     error: str
 
@@ -112,6 +116,18 @@ def read_diff_node(state: ReviewState) -> ReviewState:
     return {"changesets": changesets}
 
 
+def triage_node(state: ReviewState) -> ReviewState:
+    """节点 2（分诊）：确定性筛文件，只留下值得花模型调用深审的。
+
+    ``changesets`` 保持原样不动——定位阶段仍然用它，避免被跳过的文件导致定位失败。
+    """
+    result = triage(state.get("changesets") or [])
+    return {
+        "review_changesets": result.review,
+        "skipped_files": [item.to_dict() for item in result.skipped],
+    }
+
+
 def _extract_json(text: str) -> Dict[str, Any]:
     """容忍 ```json 围栏和前后废话的 JSON 提取。"""
     cleaned = text.strip()
@@ -147,7 +163,11 @@ def review_node(state: ReviewState, client: Optional[OpenAI] = None) -> ReviewSt
     template = state.get("template") or USER_PROMPT_TEMPLATE
 
     raw_findings: List[Dict[str, Any]] = []
-    for changeset in state.get("changesets") or []:
+    # 只深审分诊后留下的文件；没跑过 triage 时（单测直接调本节点）退化为全部文件
+    targets = state.get("review_changesets")
+    if targets is None:
+        targets = state.get("changesets") or []
+    for changeset in targets:
         prompt = template.format(file=changeset.file, diff=changeset.diff_text())
         response = llm.chat.completions.create(
             model=model,
@@ -178,11 +198,13 @@ def review_node(state: ReviewState, client: Optional[OpenAI] = None) -> ReviewSt
 
 
 def build_graph():
-    """编译 2 节点图：read_diff -> review。"""
+    """编译 3 节点图：read_diff -> triage -> review（定位在 cli 层做）。"""
     graph = StateGraph(ReviewState)
     graph.add_node("read_diff", read_diff_node)
+    graph.add_node("triage", triage_node)
     graph.add_node("review", review_node)
     graph.set_entry_point("read_diff")
-    graph.add_edge("read_diff", "review")
+    graph.add_edge("read_diff", "triage")
+    graph.add_edge("triage", "review")
     graph.add_edge("review", END)
     return graph.compile()
