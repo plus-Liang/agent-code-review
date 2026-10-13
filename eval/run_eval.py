@@ -80,6 +80,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pred", help="单个预测文件（裸数组或官方 {pr, findings} 格式）")
     parser.add_argument("--pred-dir", help="批量模式：目录下按 <pr_key>.json 命名")
     parser.add_argument("--task", help="指定 pr_key（单文件模式不填则按 head/pr 自动识别）")
+    parser.add_argument(
+        "--tasks",
+        help="只评估指定的 pr_key 子集（逗号分隔）；用于固定子集的前后对比，缺省=全部",
+    )
     parser.add_argument("--tolerance", type=int, default=0, help="行区间容差（默认 0）")
     parser.add_argument("--out", help="把报告写成 JSON")
     return parser
@@ -88,6 +92,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     tasks = load_test_set(args.corpus)
+    if args.tasks:
+        wanted = [item.strip() for item in args.tasks.split(",") if item.strip()]
+        known = {task.pr_key for task in tasks}
+        missing = [item for item in wanted if item not in known]
+        if missing:
+            print(f"[eval] --tasks 里有测试集里不存在的 pr_key：{', '.join(missing)}")
+            return 2
+        tasks = [task for task in tasks if task.pr_key in set(wanted)]
     by_key = {task.pr_key: task for task in tasks}
 
     results: List[Dict[str, object]] = []

@@ -20,6 +20,7 @@ from langgraph.graph import END, StateGraph
 from openai import OpenAI
 
 from adapter.git_diff import get_change_sets
+from core.context import build_context
 from core.triage import triage
 from findings.schema import ChangeSet
 
@@ -59,7 +60,7 @@ USER_PROMPT_TEMPLATE = """文件：{file}
 
 diff：
 {diff}
-
+{context}
 请按系统提示的 JSON 格式输出审查结论。"""
 
 
@@ -167,8 +168,24 @@ def review_node(state: ReviewState, client: Optional[OpenAI] = None) -> ReviewSt
     targets = state.get("review_changesets")
     if targets is None:
         targets = state.get("changesets") or []
+    repo = state.get("repo") or "."
     for changeset in targets:
-        prompt = template.format(file=changeset.file, diff=changeset.diff_text())
+        # 三层上下文供给（同文件 / 调用链 / 框架文档）。整层算不出来就退化成纯 diff，
+        # 由 ACR_CONTEXT_LAYERS 控制启用哪几层（默认 1,2,3）。
+        context = build_context(changeset, repo=repo)
+        context_block = (
+            "\n\n补充上下文（来自同文件非 diff 区域 / 调用链 / 框架文档，"
+            "用于判断这段改动的影响面；问题仍必须指向 diff 中的代码）：\n" + context
+            if context
+            else ""
+        )
+        try:
+            prompt = template.format(
+                file=changeset.file, diff=changeset.diff_text(), context=context_block
+            )
+        except (KeyError, IndexError):
+            # 兼容不含 {context} 占位符的旧模板（例如测试注入的假模板）
+            prompt = template.format(file=changeset.file, diff=changeset.diff_text())
         response = llm.chat.completions.create(
             model=model,
             messages=[
