@@ -30,19 +30,21 @@ class LocateTest(unittest.TestCase):
             "severity": "HIGH",
             "category": "bug",
         }
-        finding = locate_finding(raw, self.changesets)
+        finding, level = locate_finding(raw, self.changesets)
         self.assertIsNotNone(finding)
         self.assertEqual((finding.start_line, finding.end_line), (2, 2))
         self.assertEqual(finding.severity, "high")
+        self.assertEqual(level, 1)
 
     def test_unlocatable_finding_is_dropped_not_guessed(self):
-        findings, dropped = locate_findings(
+        findings, dropped, counts = locate_findings(
             [{"file": "demo.py", "existing_code": "    nope = 1", "message": "m"}],
             self.changesets,
         )
         self.assertEqual(findings, [])
         self.assertEqual(len(dropped), 1)
         self.assertIn("drop_reason", dropped[0])
+        self.assertEqual(counts["miss"], 1)
 
     def test_results_sorted(self):
         raws = [
@@ -50,9 +52,16 @@ class LocateTest(unittest.TestCase):
             {"file": "demo.py", "existing_code": "    return 1 / 0", "message": "a"},
             {"file": "demo.py", "existing_code": "import os", "message": "b"},
         ]
-        findings, dropped = locate_findings(raws, self.changesets)
+        findings, dropped, _ = locate_findings(raws, self.changesets)
         self.assertEqual([f.start_line for f in findings], [1, 2, 3])
         self.assertEqual(dropped, [])
+
+    def test_level_counts_split_by_level(self):
+        raws = [{"file": "demo.py", "existing_code": "    return 1 / 0", "message": "a"}]
+        _, _, counts = locate_findings(raws, self.changesets)
+        self.assertEqual(counts["1"], 1)
+        self.assertEqual(counts["2"], 0)
+        self.assertEqual(counts["miss"], 0)
 
 
 if __name__ == "__main__":

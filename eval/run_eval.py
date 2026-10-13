@@ -21,18 +21,53 @@ from typing import Dict, List, Optional
 
 from eval.golden_loader import GoldenTask, identify_task, load_predictions, load_test_set
 from eval.metrics import aggregate, match_findings
+from core.triage import skip_reason
+
+LAYER_PRODUCTION = "production"
+LAYER_SKIPPED = "skipped"
+
+
+def layer_of(file: str) -> str:
+    """golden 落在哪一层：分诊会深审的文件 = production，会被跳过的 = skipped。"""
+    return LAYER_SKIPPED if skip_reason(file) else LAYER_PRODUCTION
+
+
+def split_by_layer(findings):
+    buckets = {LAYER_PRODUCTION: [], LAYER_SKIPPED: []}
+    for item in findings:
+        buckets[layer_of(item.file)].append(item)
+    return buckets
 
 
 def _score_task(task: GoldenTask, pred_path: str, tolerance: int) -> Dict[str, object]:
     _, predictions = load_predictions(pred_path)
     score = match_findings(predictions, task.findings, tolerance=tolerance)
+
+    # 分层：预测按文件归层，golden 按文件归层，各层各算一次（层内互不干扰）
+    pred_layers = split_by_layer(predictions)
+    golden_layers = split_by_layer(task.findings)
+    layered = {}
+    for layer in (LAYER_PRODUCTION, LAYER_SKIPPED):
+        layered[layer] = match_findings(
+            pred_layers[layer], golden_layers[layer], tolerance=tolerance
+        )
+
     return {
         "pr_key": task.pr_key,
         "nwo": task.nwo,
         "predictions": len(predictions),
         "golden": len(task.findings),
         "score": score.to_dict(with_details=False),
+        "layers": {
+            layer: {
+                "predictions": len(pred_layers[layer]),
+                "golden": len(golden_layers[layer]),
+                "score": layered[layer].to_dict(with_details=False),
+            }
+            for layer in (LAYER_PRODUCTION, LAYER_SKIPPED)
+        },
         "_score_obj": score,
+        "_layer_objs": layered,
     }
 
 
@@ -94,16 +129,32 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     summary = total.to_dict(with_details=False)
     print(
-        f"{'MICRO':<46} {'':<11} {'':<10} "
+        f"{'TOTAL':<46} {'':<11} {'':<10} "
         f"P={summary['precision']:.3f} R={summary['recall']:.3f} F1={summary['f1']:.3f} "
         f"(tp={summary['tp']} fp={summary['fp']} fn={summary['fn']})"
     )
 
+    layer_totals = {
+        layer: aggregate([row["_layer_objs"][layer] for row in results])
+        for layer in (LAYER_PRODUCTION, LAYER_SKIPPED)
+    }
+    layer_summary = {}
+    for layer, layer_score in layer_totals.items():
+        payload = layer_score.to_dict(with_details=False)
+        layer_summary[layer] = payload
+        print(
+            f"  层[{layer:<10}] P={payload['precision']:.3f} R={payload['recall']:.3f} "
+            f"F1={payload['f1']:.3f} (tp={payload['tp']} fp={payload['fp']} fn={payload['fn']})"
+        )
+
     report = {
         "matcher": "deterministic: same-file + line-range overlap",
         "tolerance": args.tolerance,
-        "tasks": [{k: v for k, v in row.items() if k != "_score_obj"} for row in results],
+        "tasks": [
+            {k: v for k, v in row.items() if not k.startswith("_")} for row in results
+        ],
         "micro": summary,
+        "layers": layer_summary,
         "details": [row["_score_obj"].to_dict() for row in results],
     }
     if args.out:

@@ -197,6 +197,62 @@ def review_node(state: ReviewState, client: Optional[OpenAI] = None) -> ReviewSt
     return {"raw_findings": raw_findings}
 
 
+RELOCATE_SYSTEM_PROMPT = """你在做代码定位。用户给你一段代码片段，以及某个文件带行号的内容。
+
+找出这段片段在文件中的位置，只输出 JSON：
+{"start_line": <起始行号>, "end_line": <结束行号>}
+
+规则：
+- 行号是该文件里 1 起算的真实行号，直接照抄你看到的那几行前面的数字。
+- 只能给出**确实包含这段代码**的行区间；片段可能被改写或截断，按最接近的一段给。
+- 完全找不到就输出 {"start_line": null, "end_line": null}。
+- 只输出 JSON，不要解释。"""
+
+
+def make_relocator(
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model: Optional[str] = None,
+    client: Optional[OpenAI] = None,
+):
+    """构造 3 级定位用的 relocator：``(file, existing_code, numbered_file) -> (start, end) | None``。
+
+    只在 1、2 级都失败时才会被调用，所以它贵一点没关系。
+    """
+    if client is None:
+        config = resolve_llm_config(api_key=api_key, base_url=base_url, model=model)
+        llm = OpenAI(api_key=config["api_key"], base_url=config["base_url"])
+        target_model = config["model"]
+    else:
+        llm = client
+        target_model = model or os.environ.get("LLM_MODEL") or DEFAULT_MODEL
+
+    def relocate(file: str, existing_code: str, numbered_file: str):
+        user_prompt = (
+            f"文件：{file}\n\n代码片段：\n{existing_code}\n\n"
+            f"该文件带行号的内容：\n{numbered_file}\n\n请输出 JSON。"
+        )
+        response = llm.chat.completions.create(
+            model=target_model,
+            messages=[
+                {"role": "system", "content": RELOCATE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        payload = _extract_json(response.choices[0].message.content or "")
+        if not isinstance(payload, dict):
+            return None
+        start = payload.get("start_line")
+        end = payload.get("end_line", start)
+        if not isinstance(start, int) or not isinstance(end, int):
+            return None
+        return start, end
+
+    return relocate
+
+
 def build_graph():
     """编译 3 节点图：read_diff -> triage -> review（定位在 cli 层做）。"""
     graph = StateGraph(ReviewState)

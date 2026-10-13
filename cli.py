@@ -12,7 +12,7 @@ import argparse
 import json
 from pathlib import Path
 
-from core.graph import build_graph
+from core.graph import build_graph, make_relocator
 from findings.locate import locate_findings
 from findings.postprocess import postprocess
 from findings.schema import findings_to_json
@@ -32,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key", default=None, help="覆盖 DEEPSEEK_API_KEY / LLM_API_KEY")
     parser.add_argument("--max-files", type=int, default=None, help="最多审查多少个文件")
     parser.add_argument(
-        "--locate-level", type=int, default=1, help="定位等级，本阶段只支持 1"
+        "--locate-level", type=int, default=3, help="定位最高等级：1/2/3（默认 3）"
     )
     parser.add_argument(
         "--max-findings", type=int, default=20, help="后处理上限：每个 PR 最多输出几条（默认 20）"
@@ -63,7 +63,22 @@ def main(argv=None) -> int:
     skipped_files = state.get("skipped_files") or []
     review_files = state.get("review_changesets") or []
     raw_findings = state.get("raw_findings") or []
-    findings, dropped = locate_findings(raw_findings, changesets, level=args.locate_level)
+
+    # 3 级定位要 LLM；没配 key 就退化成只跑 1、2 级
+    relocator = None
+    if args.locate_level >= 3:
+        try:
+            relocator = make_relocator(
+                api_key=args.api_key, base_url=args.base_url, model=args.model
+            )
+        except RuntimeError:
+            relocator = None
+    findings, dropped, level_counts = locate_findings(
+        raw_findings,
+        changesets,
+        max_level=args.locate_level,
+        llm_relocate=relocator,
+    )
     findings, stats = postprocess(findings, max_findings=args.max_findings)
 
     out_path = Path(args.out)
@@ -77,7 +92,8 @@ def main(argv=None) -> int:
     print(
         f"[agent-code-review] {args.base}...{args.head}: "
         f"{len(changesets)} 个变更文件, 分诊后深审 {len(review_files)} 个（跳过 {len(skipped_files)}）, "
-        f"模型原始结论 {len(raw_findings)} 条, 定位成功 {stats.input} 条, 丢弃 {len(dropped)} 条, "
+        f"模型原始结论 {len(raw_findings)} 条, 定位 1级 {level_counts['1']} / 2级 {level_counts['2']} / "
+        f"3级 {level_counts['3']} / 失败 {level_counts['miss']}, "
         f"后处理合并 {stats.merged_duplicates} / 低severity {stats.dropped_severity} / "
         f"超限 {stats.dropped_over_cap} 条, 最终 {stats.kept} 条 -> {out_path}"
     )

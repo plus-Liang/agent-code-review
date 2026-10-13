@@ -49,9 +49,25 @@ class ResolverTest(unittest.TestCase):
         )
         self.assertIsNone(resolver.resolve(self.changesets, "nope.py", "    y = 2"))
 
-    def test_level_2_not_implemented(self):
-        with self.assertRaises(NotImplementedError):
-            resolver.resolve(self.changesets, "demo.py", "    y = 2", level=2)
+    def test_level_2_finds_match_outside_hunk(self):
+        # 片段在文件里，但不在任何 hunk 的上下文/新增行里 → 1 级找不到，2 级全文滑窗能找到
+        changeset = self.changesets[0]
+        changeset.new_content = (
+            "import os\nx = 1\ndef f():\n    y = 2\n    return x / y\n    return None\n"
+            "\n\n# 一大段没被改动的代码\nUNCHANGED = 'only in file'\n"
+        )
+        hit = resolver.resolve_in_changeset(changeset, "UNCHANGED = 'only in file'", max_level=2)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit.level, 2)
+        self.assertEqual(hit.start_line, 10)
+
+    def test_level_1_hit_reports_level_1(self):
+        hit = resolver.resolve_in_changeset(self.changesets[0], "    y = 2", max_level=2)
+        self.assertEqual(hit.level, 1)
+
+    def test_unknown_level_raises(self):
+        with self.assertRaises(ValueError):
+            resolver.resolve_in_changeset(self.changesets[0], "    not-in-file", max_level=4)
 
 
 if __name__ == "__main__":

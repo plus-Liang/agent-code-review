@@ -103,8 +103,9 @@ class EndToEndTest(unittest.TestCase):
         self.assertEqual(len(state["raw_findings"]), 1)
         self.assertNotIn("start_line", state["raw_findings"][0])
 
-        findings, dropped = locate_findings(state["raw_findings"], state["changesets"])
+        findings, dropped, counts = locate_findings(state["raw_findings"], state["changesets"])
         self.assertEqual(dropped, [])
+        self.assertEqual(counts["1"], 1)
         self.assertEqual(len(findings), 1)
         finding = findings[0]
         self.assertEqual(finding.file, "sample.py")
