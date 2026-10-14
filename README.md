@@ -77,6 +77,49 @@ python -m unittest discover -s tests -t .
 确定性指标（匹配/容差/一对一贪心/汇总）、golden 与预测加载、
 以及临时 git 仓库上的端到端链路（用假 LLM 客户端，不联网）。
 
+## 日志与异常处理
+
+实现见 `core/logger.py`——纯旁路，不参与业务逻辑，也不改变任何一个节点的判定。
+
+### 结构化日志
+
+每一步审查动作写**一行 JSON**，默认 stdout，`ACR_LOG_FILE` 可改为追加到文件：
+
+```json
+{"ts": "2026-01-01T12:00:00.123", "trace": "9f1c2ab3d4e5", "step": "diff_parse", "files": 2, "hits": 2, "latency_ms": 37, "error": ""}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `ts` | 该步结束时刻（毫秒精度，本地时区） |
+| `trace` | 一次 CLI 调用一个 id，把这一轮的 4 行串起来；CI 日志里 grep 一个 trace 就能还原整条链路 |
+| `step` | 固定四步：`diff_parse` / `llm_review` / `locate` / `postprocess` |
+| `files` | 这一步处理的文件数（`llm_review` 是分诊后真正送审的文件数） |
+| `hits` | 这一步的产出条数：变更文件数 → 原始结论数 → 定位成功数 → 最终保留数 |
+| `latency_ms` | 这一步的墙钟耗时，用来看时间和模型调用花在哪一步 |
+| `error` | 空串=正常；否则是失败或降级的简短原因（例如 `locate_failed:2`） |
+
+只记计数、耗时和错误类型，**不记代码内容、diff 文本与模型输出**——日志能直接进 CI 共享，
+不会顺手把源码或用户数据带出去。日志自身写失败（文件不可写等）不抛出，旁路挂掉不拖垮主流程。
+
+```bash
+python cli.py --base main --head test-branch                          # 日志进 stdout
+ACR_LOG_FILE=review.log python cli.py --base main --head test-branch  # 或追加到文件
+```
+
+### 异常处理（四类，每条都有明确失败路径）
+
+| 场景 | 失败路径 |
+| --- | --- |
+| LLM 超时 | 单次请求 180s（`LLM_TIMEOUT`）→ 最多重试 3 次（`LLM_MAX_RETRIES`）；仍失败则 `llm_review` 那行带 `error` 后向上抛，CLI 非零退出 |
+| 定位失败 | 三级降级：hunk 内匹配 → **全文滑窗**（变更后文件全文，先严格再忽略缩进）→ LLM 重定位 + 本地校验；三级都不中就丢弃该结论，数量记进 `locate` 行的 `error`（`--dump-dropped` 可导出原文） |
+| JSON 解析失败 | 同 prompt 重试一次（模型契约与 prompt 都不变）；仍解析不出来就跳过**这个文件**的结论，`error` 记 `json_parse_failed:<file>:attempt2`，其余文件继续审 |
+| API 限流（429） | openai SDK 内置指数退避重试，次数与超时共用 `LLM_MAX_RETRIES`（默认 3）；重试耗尽后同上抛，不会假装审查成功 |
+
+口径：能降级的降级（单条定位、单个文件的结论），不能降级的（整轮 LLM 不可用）就带着 `error`
+明确失败——**没有哪一类是静默吞掉**。降级丢掉的条目一律有计数或 `--dump-dropped` 可查，
+所以"报得少"永远能追溯到是模型没报、还是哪一级把它丢了。
+
 ## 评估接入（第二阶段）
 
 数据集用 GitHub 官方的 [ReviewBench](https://github.com/review-bench/ReviewBench)：

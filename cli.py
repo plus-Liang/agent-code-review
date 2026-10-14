@@ -20,6 +20,7 @@ from core.filter import (
     filter_by_type,
 )
 from core.graph import build_graph, make_relocator
+from core.logger import step_log
 from findings.locate import locate_findings
 from findings.postprocess import postprocess
 from findings.schema import findings_to_json
@@ -102,15 +103,22 @@ def main(argv=None) -> int:
     raw_findings, type_stats = filter_by_type(raw_findings, mode=args.type_mode)
     # 闸 1（置信度）：模型自评把握不足的先丢掉，省下低置信度条目的定位预算
     raw_findings, conf_stats = filter_by_confidence(raw_findings)
-    findings, dropped, level_counts = locate_findings(
-        raw_findings,
-        changesets,
-        max_level=args.locate_level,
-        llm_relocate=relocator,
-    )
+    with step_log("locate", files=len(changesets)) as log:
+        findings, dropped, level_counts = locate_findings(
+            raw_findings,
+            changesets,
+            max_level=args.locate_level,
+            llm_relocate=relocator,
+        )
+        log["hits"] = len(findings)
+        # 定位失败不是致命错误（三级都找不到就丢弃），但必须可见——不静默丢结论
+        if level_counts.get("miss"):
+            log["error"] = f"locate_failed:{level_counts['miss']}"
     # 闸 2（聚类去重）：同文件里换着说法重复报的同一处问题，每组只留最具体的一条
     findings, cluster_stats = cluster_findings(findings)
-    findings, stats = postprocess(findings, max_findings=args.max_findings)
+    with step_log("postprocess", files=len(changesets)) as log:
+        findings, stats = postprocess(findings, max_findings=args.max_findings)
+        log["hits"] = stats.kept
 
     out_path = Path(args.out)
     out_path.write_text(findings_to_json(findings), encoding="utf-8")
