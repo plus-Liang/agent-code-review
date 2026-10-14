@@ -26,8 +26,16 @@ jobs:
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
+          set -euo pipefail
           git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
           git rev-parse --verify "origin/${BASE_REF}" > /dev/null
+          # 内容含 NUL 字节的文件会被 git 当二进制：三点 diff 没有任何 hunk，
+          # adapter/git_diff.py 会按"二进制文件"跳过它，日志只剩 0 个变更文件。
+          # 这里只告警不失败——PR 里合法地新增 png/zip 等资源也属于这种情况。
+          binary="$(git diff --numstat "origin/${BASE_REF}...HEAD" | awk '$1 == "-" && $2 == "-" {print $3}')"
+          if [ -n "${binary}" ]; then
+            echo "::warning::以下文件被 git 当二进制（内容含 NUL 字节），本次审查会跳过：${binary}"
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
