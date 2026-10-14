@@ -19,6 +19,8 @@ from typing import Any, Dict, List, Optional
 SEVERITY_LEVELS = ("critical", "high", "medium", "low", "info")
 # 类别：留给模型的自由分类，未知值统一归到 "other"。
 CATEGORY_LEVELS = ("bug", "security", "performance", "style", "maintainability", "other")
+# 模型没给 / 给不出置信度时的兜底值：不淘汰，但标成待复核。
+DEFAULT_CONFIDENCE = 0.5
 
 _ADDED = "+"
 _REMOVED = "-"
@@ -145,6 +147,10 @@ class Finding:
     message: str
     severity: str = "medium"
     category: str = "other"
+    # 模型自评的置信度（0~1）：越高越确信这是真实缺陷而不是误报。
+    confidence: float = 1.0
+    # 0.5 ~ 0.8 的结论不淘汰，但标出来让人看一眼（见 core/filter.py）。
+    needs_review: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -154,6 +160,8 @@ class Finding:
             "message": self.message,
             "severity": self.severity,
             "category": self.category,
+            "confidence": self.confidence,
+            "needs_review": self.needs_review,
         }
 
     @classmethod
@@ -165,6 +173,8 @@ class Finding:
             message=data.get("message", ""),
             severity=normalize_severity(data.get("severity")),
             category=normalize_category(data.get("category")),
+            confidence=normalize_confidence(data.get("confidence", 1.0)),
+            needs_review=bool(data.get("needs_review", False)),
         )
 
 
@@ -176,6 +186,29 @@ def normalize_severity(value: Optional[str]) -> str:
 def normalize_category(value: Optional[str]) -> str:
     text = (value or "").strip().lower()
     return text if text in CATEGORY_LEVELS else "other"
+
+
+def normalize_confidence(value: Any) -> float:
+    """把模型给的置信度收敛到 0~1。
+
+    容忍 ``None`` / ``"0.9"`` / ``90`` / ``"85%"`` 这几种写法；实在解析不出来
+    （缺失、乱码、布尔值）就返回 :data:`DEFAULT_CONFIDENCE`——按"待复核"处理，
+    既不误杀也不信任。
+    """
+    if isinstance(value, bool):
+        return DEFAULT_CONFIDENCE
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        text = str(value or "").strip().rstrip("%")
+        try:
+            number = float(text)
+        except ValueError:
+            return DEFAULT_CONFIDENCE
+    if number > 1.0:
+        # 模型有时给百分数（90 而不是 0.9）
+        number = number / 100.0 if number <= 100.0 else 1.0
+    return min(1.0, max(0.0, number))
 
 
 def findings_to_json(findings: List[Finding], indent: int = 2) -> str:

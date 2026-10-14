@@ -12,6 +12,7 @@ import argparse
 import json
 from pathlib import Path
 
+from core.filter import cluster_findings, filter_by_confidence
 from core.graph import build_graph, make_relocator
 from findings.locate import locate_findings
 from findings.postprocess import postprocess
@@ -73,12 +74,16 @@ def main(argv=None) -> int:
             )
         except RuntimeError:
             relocator = None
+    # 闸 1（置信度）：模型自评把握不足的先丢掉，省下低置信度条目的定位预算
+    raw_findings, conf_stats = filter_by_confidence(raw_findings)
     findings, dropped, level_counts = locate_findings(
         raw_findings,
         changesets,
         max_level=args.locate_level,
         llm_relocate=relocator,
     )
+    # 闸 2（聚类去重）：同文件里换着说法重复报的同一处问题，每组只留最具体的一条
+    findings, cluster_stats = cluster_findings(findings)
     findings, stats = postprocess(findings, max_findings=args.max_findings)
 
     out_path = Path(args.out)
@@ -94,6 +99,8 @@ def main(argv=None) -> int:
         f"{len(changesets)} 个变更文件, 分诊后深审 {len(review_files)} 个（跳过 {len(skipped_files)}）, "
         f"模型原始结论 {len(raw_findings)} 条, 定位 1级 {level_counts['1']} / 2级 {level_counts['2']} / "
         f"3级 {level_counts['3']} / 失败 {level_counts['miss']}, "
+        f"置信度丢弃 {conf_stats.dropped_low_confidence} / 待复核 {conf_stats.needs_review} 条, "
+        f"聚类合并 {cluster_stats.merged} 条（{cluster_stats.clusters} 组）, "
         f"后处理合并 {stats.merged_duplicates} / 低severity {stats.dropped_severity} / "
         f"超限 {stats.dropped_over_cap} 条, 最终 {stats.kept} 条 -> {out_path}"
     )

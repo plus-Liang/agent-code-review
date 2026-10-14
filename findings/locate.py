@@ -10,7 +10,13 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from core import resolver
-from findings.schema import ChangeSet, Finding, normalize_category, normalize_severity
+from findings.schema import (
+    ChangeSet,
+    Finding,
+    normalize_category,
+    normalize_confidence,
+    normalize_severity,
+)
 
 Relocator = Callable[[str, str, str], Optional[Tuple[int, int]]]
 
@@ -42,6 +48,8 @@ def locate_finding(
         message=(raw.get("message") or "").strip(),
         severity=normalize_severity(raw.get("severity")),
         category=normalize_category(raw.get("category")),
+        confidence=normalize_confidence(raw.get("confidence")),
+        needs_review=bool(raw.get("needs_review", False)),
     )
     return finding, hit.level
 

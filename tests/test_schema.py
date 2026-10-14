@@ -54,7 +54,16 @@ class SchemaTest(unittest.TestCase):
         payload = finding.to_dict()
         self.assertEqual(
             set(payload),
-            {"file", "start_line", "end_line", "message", "severity", "category"},
+            {
+                "file",
+                "start_line",
+                "end_line",
+                "message",
+                "severity",
+                "category",
+                "confidence",
+                "needs_review",
+            },
         )
         self.assertEqual(Finding.from_dict(payload), finding)
 

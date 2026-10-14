@@ -22,7 +22,7 @@ from openai import OpenAI
 from adapter.git_diff import get_change_sets
 from core.context import build_context
 from core.triage import triage
-from findings.schema import ChangeSet
+from findings.schema import ChangeSet, normalize_confidence
 
 DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 DEFAULT_MODEL = "deepseek-chat"
@@ -61,11 +61,22 @@ SYSTEM_PROMPT = """你是一名严格但务实的资深代码审查员，审查�
 - 测试文件里的任何内容（路径含 tests/、__tests__/，或文件名形如 test_* / *.test.* / *_test.*）
 - 纯文档、CHANGELOG、README、模板文本
 
-严重级：按真实影响标 high / medium / low。不确定严重程度时，按你认为最接近的一档标出来即可，
-不要因为不确定就省略问题——漏报比多报一条更糟。
+严重级：按真实影响标 high / medium / low。不确定严重程度时，按你认为最接近的一档标出来即可。
+严重级和 confidence 是两回事：前者是"假如成立，影响多大"，后者是"你有多确定它成立"。
 
 输出必须是 JSON，格式：
-{"findings": [{"existing_code": "...", "message": "...", "severity": "high|medium|low", "category": "bug|security|performance|reliability|maintainability"}]}
+{"findings": [{"existing_code": "...", "message": "...", "severity": "high|medium|low", "category": "bug|security|performance|reliability|maintainability", "confidence": 0.9}]}
+
+confidence 是你"敢不敢为这条结论负责"的把握，按证据强度如实填 0~1 的小数——
+不要因为已经写出来了就抬高，虚高的代价是评审人不再信任这份报告：
+- 0.8 ~ 1.0：只看这段 diff 就能指出确定的失败路径或后果，不依赖 diff 之外的信息；
+- 0.5 ~ 0.8：现象真实，但结论取决于调用方 / 配置 / 运行时版本，或依赖 diff 之外的上下文；
+- 0 ~ 0.5：只是觉得"这么写有风险"，说不出具体失败路径，或属于风格与主观偏好。
+
+打分方法：给一条结论打分前，先在心里说出"什么输入会让它走到哪一行、然后发生什么后果"——
+说得出来才算 0.8 以上，说不出来就压到 0.5 以下。
+如实标低不会被处罚：报一条标 0.3 的问题，比把它抬到 0.7 有用得多。同一批结论的 confidence
+取值如果少于 4 种，说明你没有逐条评估，请重来。
 
 硬性要求：
 1. existing_code 必须**逐字照抄**变更后文件中的原始代码行（可以有 1~5 行），
@@ -230,6 +241,7 @@ def review_node(state: ReviewState, client: Optional[OpenAI] = None) -> ReviewSt
                     "message": item.get("message", ""),
                     "severity": item.get("severity"),
                     "category": item.get("category"),
+                    "confidence": normalize_confidence(item.get("confidence")),
                 }
             )
     return {"raw_findings": raw_findings}
