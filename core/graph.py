@@ -22,6 +22,7 @@ from openai import OpenAI
 from adapter.git_diff import get_change_sets
 from core.context import build_context
 from core.filter import FILE_SCORE_THRESHOLD, score_changeset
+from core.logger import step_log
 from core.triage import triage
 from findings.schema import ChangeSet, normalize_confidence
 
@@ -149,12 +150,15 @@ def resolve_llm_config(
 
 def read_diff_node(state: ReviewState) -> ReviewState:
     """节点 1：读本地 diff，产出 ChangeSet 列表。"""
-    changesets = get_change_sets(
-        base=state["base"],
-        head=state["head"],
-        repo=state.get("repo") or ".",
-        max_files=state.get("max_files"),
-    )
+    with step_log("diff_parse") as log:
+        changesets = get_change_sets(
+            base=state["base"],
+            head=state["head"],
+            repo=state.get("repo") or ".",
+            max_files=state.get("max_files"),
+        )
+        log["files"] = len(changesets)
+        log["hits"] = len(changesets)
     return {"changesets": changesets}
 
 
@@ -230,49 +234,64 @@ def review_node(state: ReviewState, client: Optional[OpenAI] = None) -> ReviewSt
     if targets is None:
         targets = state.get("changesets") or []
     repo = state.get("repo") or "."
-    for changeset in targets:
-        # 三层上下文供给（同文件 / 调用链 / 框架文档）。整层算不出来就退化成纯 diff，
-        # 由 ACR_CONTEXT_LAYERS 控制启用哪几层（默认 1,2,3）。
-        context = build_context(changeset, repo=repo)
-        context_block = (
-            "\n\n补充上下文（来自同文件非 diff 区域 / 调用链 / 框架文档，"
-            "用于判断这段改动的影响面；问题仍必须指向 diff 中的代码）：\n" + context
-            if context
-            else ""
-        )
-        try:
-            prompt = template.format(
-                file=changeset.file, diff=changeset.diff_text(), context=context_block
+    with step_log("llm_review", files=len(targets)) as log:
+        for changeset in targets:
+            # 三层上下文供给（同文件 / 调用链 / 框架文档）。整层算不出来就退化成纯 diff，
+            # 由 ACR_CONTEXT_LAYERS 控制启用哪几层（默认 1,2,3）。
+            context = build_context(changeset, repo=repo)
+            context_block = (
+                "\n\n补充上下文（来自同文件非 diff 区域 / 调用链 / 框架文档，"
+                "用于判断这段改动的影响面；问题仍必须指向 diff 中的代码）：\n" + context
+                if context
+                else ""
             )
-        except (KeyError, IndexError):
-            # 兼容不含 {context} 占位符的旧模板（例如测试注入的假模板）
-            prompt = template.format(file=changeset.file, diff=changeset.diff_text())
-        response = llm.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0,
-            response_format={"type": "json_object"},
-        )
-        payload = _extract_json(response.choices[0].message.content or "")
-        items = payload.get("findings", payload) if isinstance(payload, dict) else payload
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            if not isinstance(item, dict) or not item.get("existing_code"):
+            try:
+                prompt = template.format(
+                    file=changeset.file, diff=changeset.diff_text(), context=context_block
+                )
+            except (KeyError, IndexError):
+                # 兼容不含 {context} 占位符的旧模板（例如测试注入的假模板）
+                prompt = template.format(file=changeset.file, diff=changeset.diff_text())
+
+            # JSON 解析失败 → 同 prompt 重试一次；仍失败就跳过这个文件的结论。
+            # 重试的是"解析"，模型契约与 prompt 都不变；跳过时把原因写进日志，不静默吞掉。
+            payload: Any = None
+            for attempt in (1, 2):
+                response = llm.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0,
+                    response_format={"type": "json_object"},
+                )
+                try:
+                    payload = _extract_json(response.choices[0].message.content or "")
+                    break
+                except ValueError:
+                    payload = None
+                    log["error"] = f"json_parse_failed:{changeset.file}:attempt{attempt}"
+            if payload is None:
                 continue
-            raw_findings.append(
-                {
-                    "file": changeset.file,  # 文件由调用方确定，模型不参与
-                    "existing_code": item["existing_code"],
-                    "message": item.get("message", ""),
-                    "severity": item.get("severity"),
-                    "category": item.get("category"),
-                    "confidence": normalize_confidence(item.get("confidence")),
-                }
-            )
+
+            items = payload.get("findings", payload) if isinstance(payload, dict) else payload
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict) or not item.get("existing_code"):
+                    continue
+                raw_findings.append(
+                    {
+                        "file": changeset.file,  # 文件由调用方确定，模型不参与
+                        "existing_code": item["existing_code"],
+                        "message": item.get("message", ""),
+                        "severity": item.get("severity"),
+                        "category": item.get("category"),
+                        "confidence": normalize_confidence(item.get("confidence")),
+                    }
+                )
+            log["hits"] = len(raw_findings)
     return {"raw_findings": raw_findings}
 
 
