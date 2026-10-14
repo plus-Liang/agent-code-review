@@ -21,6 +21,7 @@ from openai import OpenAI
 
 from adapter.git_diff import get_change_sets
 from core.context import build_context
+from core.filter import FILE_SCORE_THRESHOLD, score_changeset
 from core.triage import triage
 from findings.schema import ChangeSet, normalize_confidence
 
@@ -50,16 +51,24 @@ def _new_client(api_key: str, base_url: str) -> OpenAI:
 
 SYSTEM_PROMPT = """你是一名严格但务实的资深代码审查员，审查的是一个真实 PR 里改动的 production 代码。
 
-只报这三类问题：
-- 安全漏洞：注入、路径穿越、鉴权缺失、敏感信息泄露、不安全反序列化/eval
-- 正确性缺陷：逻辑错误、边界条件、空值/除零、并发竞态、状态不一致
-- 可靠性问题：资源泄漏、异常被吞、缺少超时/重试、错误的平台假设
+**类型白名单：只报下面这六类，第六类之外一律不要报。**
 
-以下**不算问题，一律不要报**：
-- 样式、格式、缩进、命名、注释措辞、代码优雅度、"建议重构"
-- CSS 变量、颜色值、对比度、主题/视觉微调
+必报（命中即报，不要因为"看起来不确定"而漏掉）：
+1. SQL 注入：查询语句用字符串拼接 / f-string 拼进 SQL、把用户输入直接当 SQL 执行
+2. 路径穿越：用户可控的文件路径未规范化 / 未校验就参与读写
+3. XSS：未转义的 HTML / 脚本注入、dangerouslySetInnerHTML / v-html / innerHTML 直接吃用户输入
+4. 空指针：解引用可能为 null/None/nil/undefined 的值、缺少空值判断
+5. 越界：数组 / 切片 / 缓冲区的下标或长度可能越界（含 off-by-one）
+6. 资源泄漏：文件 / 连接 / 锁 / 事务 / 句柄未关闭或未释放（缺 finally / try-with-resources）
+
+以下**不算问题，一律不要报**（后处理也会按同一套规则丢弃，写了等于浪费 token）：
+- 命名 / 变量名 / 函数名 / 拼写
+- 注释 / docstring / 文档说明
+- CSS / 样式 / 主题 / 颜色 / 对比度 / 视觉微调
+- 文档、CHANGELOG、README、模板文本
+- 格式 / 缩进 / 换行 / lint / 分号 / 行宽
 - 测试文件里的任何内容（路径含 tests/、__tests__/，或文件名形如 test_* / *.test.* / *_test.*）
-- 纯文档、CHANGELOG、README、模板文本
+- 泛泛的"建议重构" / 可读性 / 可维护性 / 提取重复代码 / 未使用变量 / 性能优化建议
 
 严重级：按真实影响标 high / medium / low。不确定严重程度时，按你认为最接近的一档标出来即可。
 严重级和 confidence 是两回事：前者是"假如成立，影响多大"，后者是"你有多确定它成立"。
@@ -152,13 +161,33 @@ def read_diff_node(state: ReviewState) -> ReviewState:
 def triage_node(state: ReviewState) -> ReviewState:
     """节点 2（分诊）：确定性筛文件，只留下值得花模型调用深审的。
 
-    ``changesets`` 保持原样不动——定位阶段仍然用它，避免被跳过的文件导致定位失败。
+    两道确定性闸，都不调 LLM：
+      1. 路径规则（``core/triage.py``）：测试 / 样式 / 文档 / 依赖清单 / 生成物；
+      2. **文件级评分**（``core/filter.py``）：production 逻辑 +0.4、改动 > 5 行 +0.3、
+         敏感操作（DB / 文件 / 网络 / 权限）+0.3，低于 ``FILE_SCORE_THRESHOLD`` 的文件
+         整份不送审——省下的是真金白银的模型调用。
+
+    ``changesets`` 保持原样不动——定位阶段仍然用它，避免被跳过的文件导致定位失败；
+    真正被跳过的是"这些文件不会产生新的模型结论"。
     """
     result = triage(state.get("changesets") or [])
-    return {
-        "review_changesets": result.review,
-        "skipped_files": [item.to_dict() for item in result.skipped],
-    }
+    skipped = [item.to_dict() for item in result.skipped]
+    threshold = float(os.environ.get("ACR_FILE_SCORE_THRESHOLD") or FILE_SCORE_THRESHOLD)
+
+    review: List[ChangeSet] = []
+    for changeset in result.review:
+        score = score_changeset(changeset)
+        if score.score >= threshold:
+            review.append(changeset)
+            continue
+        skipped.append(
+            {
+                "file": changeset.file,
+                "reason": f"low-file-score({score.score:.2f})",
+                "detail": ",".join(score.reasons) or "no-signal",
+            }
+        )
+    return {"review_changesets": review, "skipped_files": skipped}
 
 
 def _extract_json(text: str) -> Dict[str, Any]:

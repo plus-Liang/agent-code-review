@@ -6,11 +6,22 @@ import unittest
 
 from core.graph import triage_node
 from core.triage import skip_reason, triage
-from findings.schema import ChangeSet
+from findings.schema import ChangeSet, Hunk, HunkLine
 
 
 def cs(path: str) -> ChangeSet:
     return ChangeSet(file=path, head_start=1, head_end=1)
+
+
+def cs_sensitive(path: str) -> ChangeSet:
+    """有敏感操作 + production 路径的 changeset，用来过文件级评分那道闸。"""
+    line = HunkLine(type="+", content="await db.query(sql)", new_line=1)
+    return ChangeSet(
+        file=path,
+        head_start=1,
+        head_end=1,
+        hunks=[Hunk(old_start=1, old_lines=1, new_start=1, new_lines=1, lines=[line])],
+    )
 
 
 class SkipReasonTest(unittest.TestCase):
@@ -68,12 +79,26 @@ class TriageTest(unittest.TestCase):
         self.assertEqual(reasons["public/main.css"], "style")
 
     def test_node_keeps_changesets_for_locating(self):
-        state = {"changesets": [cs("src/a.ts"), cs("src/b.test.ts")]}
+        state = {"changesets": [cs_sensitive("src/a.ts"), cs("src/b.test.ts")]}
         updated = triage_node(state)
         # 原始 changesets 不动，定位阶段还要用它
         self.assertEqual(len(state["changesets"]), 2)
         self.assertEqual([item.file for item in updated["review_changesets"]], ["src/a.ts"])
         self.assertEqual(len(updated["skipped_files"]), 1)
+
+    def test_node_skips_files_below_file_score_threshold(self):
+        # 无 hunk（改动 0 行）也无敏感操作 → 0.4 分，低于 0.5，不送 LLM
+        state = {"changesets": [cs("src/a.ts")]}
+        updated = triage_node(state)
+        self.assertEqual(updated["review_changesets"], [])
+        self.assertEqual(len(updated["skipped_files"]), 1)
+        self.assertEqual(updated["skipped_files"][0]["reason"], "low-file-score(0.40)")
+
+    def test_node_keeps_sensitive_production_file(self):
+        state = {"changesets": [cs_sensitive("src/a.ts")]}
+        updated = triage_node(state)
+        self.assertEqual([item.file for item in updated["review_changesets"]], ["src/a.ts"])
+        self.assertEqual(updated["skipped_files"], [])
 
 
 if __name__ == "__main__":

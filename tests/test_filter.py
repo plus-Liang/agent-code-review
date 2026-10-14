@@ -1,15 +1,34 @@
-"""降误报后处理测试：置信度闸 + 语义聚类去重。"""
+"""降误报后处理测试：类型白名单 + 文件级评分 + 置信度闸 + 语义聚类去重。"""
 
 from __future__ import annotations
 
 import unittest
 
 from core.filter import (
+    DROP_COMMENT,
+    DROP_FORMAT,
+    DROP_NAMING,
+    DROP_REFACTOR,
+    DROP_STYLE,
+    TYPE_NULL_POINTER,
+    TYPE_OUT_OF_BOUNDS,
+    TYPE_PATH_TRAVERSAL,
+    TYPE_RESOURCE_LEAK,
+    TYPE_SQL_INJECTION,
+    TYPE_XSS,
     bigram_similarity,
+    changed_line_count,
+    classify_type,
     cluster_findings,
     filter_by_confidence,
+    filter_by_type,
+    filter_files_by_score,
+    has_sensitive_operation,
+    is_production_path,
+    score_changeset,
+    should_review_file,
 )
-from findings.schema import Finding, normalize_confidence
+from findings.schema import ChangeSet, Finding, Hunk, HunkLine, normalize_confidence
 
 
 def raw(message: str, confidence, file: str = "a.py") -> dict:
@@ -70,6 +89,194 @@ class ConfidenceGateTest(unittest.TestCase):
         item = raw("x", 0.6)
         filter_by_confidence([item])
         self.assertNotIn("needs_review", item)
+
+
+def hunk(lines, new_start: int = 1) -> Hunk:
+    """把 ("+"|"-"|" ", content) 列表包成一个 hunk，并补上新侧行号。"""
+    items = []
+    number = new_start
+    for kind, content in lines:
+        new_line = None if kind == "-" else number
+        items.append(HunkLine(type=kind, content=content, new_line=new_line))
+        if kind != "-":
+            number += 1
+    return Hunk(
+        old_start=new_start,
+        old_lines=len(items),
+        new_start=new_start,
+        new_lines=len(items),
+        lines=items,
+    )
+
+
+def changeset(path: str, lines, old: str = "", new: str = "") -> ChangeSet:
+    hs = [hunk(lines)] if lines else []
+    return ChangeSet(file=path, head_start=1, head_end=len(lines), hunks=hs,
+                     old_content=old, new_content=new)
+
+
+class TypeWhitelistClassifyTest(unittest.TestCase):
+    """类型白名单的归类：六类"必报"要认出来，"不报"那一栏也要认出来。"""
+
+    def test_required_types_are_detected_from_real_messages(self):
+        cases = [
+            (
+                "查询语句用字符串拼接用户输入，存在 SQL 注入",
+                TYPE_SQL_INJECTION,
+            ),
+            (
+                "workspaceId 为绝对路径时 path.resolve 会直接返回该路径，startsWith 校验被绕过",
+                TYPE_PATH_TRAVERSAL,
+            ),
+            (
+                "dangerouslySetInnerHTML 直接吃用户输入，未转义，存在 XSS",
+                TYPE_XSS,
+            ),
+            (
+                "msg.settings 未做空值校验即解构，收到缺失字段会抛 TypeError",
+                TYPE_NULL_POINTER,
+            ),
+            (
+                "activePaletteIndex 越界时未处理，可能访问 palettes 之外的下标",
+                TYPE_OUT_OF_BOUNDS,
+            ),
+            (
+                "快照文件没有任何删除逻辑，长期运行造成存储泄漏",
+                TYPE_RESOURCE_LEAK,
+            ),
+            (
+                "文件句柄 open 之后没有 try/finally，异常路径下不会 close",
+                TYPE_RESOURCE_LEAK,
+            ),
+        ]
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(classify_type(message, "bug"), expected)
+
+    def test_not_reported_categories(self):
+        cases = [
+            ("变量命名不一致，建议改成 camelCase", DROP_NAMING),
+            ("缺少注释，文档字符串没写清楚参数", DROP_COMMENT),
+            ("CSS 颜色值硬编码，主题对比度不足", DROP_STYLE),
+            ("缩进和格式不统一，应该跑一下 prettier", DROP_FORMAT),
+            ("这段代码可以重构，重复代码建议提取函数", DROP_REFACTOR),
+        ]
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(classify_type(message, "maintainability"), expected)
+
+    def test_unclassified_returns_none(self):
+        self.assertIsNone(classify_type("防抖写入 effect 中三次 await 串行执行且没有 try/catch", "bug"))
+        self.assertIsNone(classify_type("", None))
+
+
+class TypeWhitelistGateTest(unittest.TestCase):
+    def _items(self):
+        return [
+            raw("SQL 注入：拼接用户输入到查询", 0.9),
+            raw("命名不一致，建议改一下", 0.9),
+            raw("CSS 对比度不足", 0.9),
+            raw("这段可以重构，建议提取函数", 0.9),
+            raw("并发竞态导致状态不一致", 0.9),
+        ]
+
+    def test_blacklist_mode_drops_only_the_do_not_report_bucket(self):
+        kept, stats = filter_by_type(self._items(), mode="blacklist")
+        self.assertEqual([item["message"] for item in kept], [
+            "SQL 注入：拼接用户输入到查询",
+            "并发竞态导致状态不一致",
+        ])
+        self.assertEqual(stats.dropped, 3)
+        self.assertEqual(stats.per_type[DROP_NAMING], 1)
+        self.assertEqual(stats.per_type[DROP_REFACTOR], 1)
+
+    def test_strict_mode_keeps_only_required_types(self):
+        kept, stats = filter_by_type(self._items(), mode="strict")
+        self.assertEqual([item["message"] for item in kept], ["SQL 注入：拼接用户输入到查询"])
+        self.assertEqual(stats.dropped, 4)
+        self.assertEqual(stats.per_type["unclassified"], 1)
+
+    def test_input_is_not_mutated(self):
+        items = self._items()
+        filter_by_type(items, mode="blacklist")
+        self.assertEqual(len(items), 5)
+
+
+class FileScoreTest(unittest.TestCase):
+    def test_production_path(self):
+        self.assertTrue(is_production_path("src/app/main.py"))
+        self.assertTrue(is_production_path("server/index.js"))
+        self.assertTrue(is_production_path(".github/workflows/publish.yml"))
+        self.assertTrue(is_production_path("Dockerfile"))
+        # 测试 / 文档 / 样式 / 依赖清单 / 生成物 / 非代码文件都不算 production
+        self.assertFalse(is_production_path("tests/test_app.py"))
+        self.assertFalse(is_production_path("src/components/App.css"))
+        self.assertFalse(is_production_path("README.md"))
+        self.assertFalse(is_production_path("package.json"))
+        self.assertFalse(is_production_path("dist/bundle.min.js"))
+
+    def test_changed_line_count_counts_added_and_removed(self):
+        cs = changeset("src/a.py", [(" ", "ctx"), ("+", "new"), ("-", "old")])
+        self.assertEqual(changed_line_count(cs), 2)
+
+    def test_sensitive_operation(self):
+        self.assertTrue(has_sensitive_operation(changeset("src/a.py", [("+", "cur.execute(sql)")])))
+        self.assertTrue(has_sensitive_operation(changeset("src/a.py", [("+", "await fetch(url)")])))
+        self.assertTrue(has_sensitive_operation(changeset("src/a.py", [("+", "await fs.promises.open(path)")])))
+        self.assertFalse(has_sensitive_operation(changeset("src/a.py", [("+", "total = a + b")])))
+        # 删除行也算
+        self.assertTrue(has_sensitive_operation(changeset("src/a.py", [("-", "conn.close()")])))
+
+    def test_score_is_the_sum_of_three_signals(self):
+        # production + 改动 > 5 行 + 敏感操作 = 1.0
+        cs = changeset("src/a.py", [("+", f"query = f'select {i}'") for i in range(6)])
+        score = score_changeset(cs)
+        self.assertAlmostEqual(score.score, 1.0)
+        self.assertEqual(len(score.reasons), 3)
+
+    def test_score_production_only(self):
+        cs = changeset("src/a.py", [("+", "total = a + b")])
+        self.assertAlmostEqual(score_changeset(cs).score, 0.4)
+        self.assertFalse(should_review_file(cs))
+
+    def test_score_production_plus_sensitive_without_large_change(self):
+        cs = changeset("src/a.py", [("+", "cur.execute(sql)")])
+        self.assertAlmostEqual(score_changeset(cs).score, 0.7)
+        self.assertTrue(should_review_file(cs))
+
+    def test_non_code_file_loses_the_production_point(self):
+        # 非代码/配置文件拿不到 production 那 0.4 分——同样大小同样敏感，分数更低
+        non_code = changeset("assets/data/seed.txt", [("+", "select * from users") for _ in range(10)])
+        code = changeset("src/a.py", [("+", "select * from users") for _ in range(10)])
+        self.assertLess(score_changeset(non_code).score, score_changeset(code).score)
+        self.assertAlmostEqual(score_changeset(non_code).score, 0.6)
+        self.assertAlmostEqual(score_changeset(code).score, 1.0)
+
+    def test_manifest_and_style_files_are_below_threshold(self):
+        manifest = changeset("package.json", [("+", "\"name\": \"x\"") for _ in range(10)])
+        self.assertFalse(should_review_file(manifest))
+
+    def test_style_file_is_below_threshold(self):
+        cs = changeset("src/App.css", [("+", ".a { color: red }") for _ in range(20)])
+        self.assertFalse(should_review_file(cs))
+
+    def test_threshold_is_configurable(self):
+        cs = changeset("src/a.py", [("+", "total = a + b")])
+        self.assertFalse(should_review_file(cs, threshold=0.5))
+        self.assertTrue(should_review_file(cs, threshold=0.4))
+
+    def test_filter_files_by_score_drops_files_and_their_findings(self):
+        keep = changeset("src/a.py", [("+", "cur.execute(sql)")])
+        drop = changeset("docs/notes.md", [("+", "hello")])
+        findings = [
+            {"file": "src/a.py", "message": "m1"},
+            {"file": "docs/notes.md", "message": "m2"},
+        ]
+        kept_cs, kept_findings, stats = filter_files_by_score([keep, drop], findings)
+        self.assertEqual([item.file for item in kept_cs], ["src/a.py"])
+        self.assertEqual([item["message"] for item in kept_findings], ["m1"])
+        self.assertEqual((stats.skipped_files, stats.skipped_findings), (1, 1))
+        self.assertEqual(stats.skipped_detail[0]["file"], "docs/notes.md")
 
 
 class BigramSimilarityTest(unittest.TestCase):

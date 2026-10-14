@@ -10,9 +10,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
-from core.filter import cluster_findings, filter_by_confidence
+from core.filter import (
+    DEFAULT_TYPE_MODE,
+    cluster_findings,
+    filter_by_confidence,
+    filter_by_type,
+)
 from core.graph import build_graph, make_relocator
 from findings.locate import locate_findings
 from findings.postprocess import postprocess
@@ -41,11 +47,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dump-dropped", action="store_true", help="把定位失败的原始结论写到 <out>.dropped.json"
     )
+    parser.add_argument(
+        "--type-mode",
+        choices=("blacklist", "strict"),
+        default=DEFAULT_TYPE_MODE,
+        help="类型白名单口径：blacklist=只丢命名/注释/CSS/文档/格式/测试/重构（默认）；"
+        "strict=必须命中 SQL注入/路径穿越/XSS/空指针/越界/资源泄漏 六类之一",
+    )
+    parser.add_argument(
+        "--file-score-threshold",
+        type=float,
+        default=None,
+        help="文件级评分阈值，低于它的文件不送 LLM（默认 0.5，等价 ACR_FILE_SCORE_THRESHOLD）",
+    )
     return parser
 
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+
+    # 文件级评分阈值的优先级：命令行 > 环境变量 > 默认值（默认在 core/filter.py）
+    if args.file_score_threshold is not None:
+        os.environ["ACR_FILE_SCORE_THRESHOLD"] = str(args.file_score_threshold)
 
     graph = build_graph()
     state = graph.invoke(
@@ -74,6 +97,9 @@ def main(argv=None) -> int:
             )
         except RuntimeError:
             relocator = None
+    # 闸 0（类型白名单）：只放行"必报"的六类漏洞/缺陷，丢掉命名/注释/CSS/文档/格式/重构。
+    # 纯字符串匹配，在定位前做——低价值条目不必再花定位预算。
+    raw_findings, type_stats = filter_by_type(raw_findings, mode=args.type_mode)
     # 闸 1（置信度）：模型自评把握不足的先丢掉，省下低置信度条目的定位预算
     raw_findings, conf_stats = filter_by_confidence(raw_findings)
     findings, dropped, level_counts = locate_findings(
@@ -96,9 +122,10 @@ def main(argv=None) -> int:
 
     print(
         f"[agent-code-review] {args.base}...{args.head}: "
-        f"{len(changesets)} 个变更文件, 分诊后深审 {len(review_files)} 个（跳过 {len(skipped_files)}）, "
+        f"{len(changesets)} 个变更文件, 分诊+文件评分后深审 {len(review_files)} 个（跳过 {len(skipped_files)}）, "
         f"模型原始结论 {len(raw_findings)} 条, 定位 1级 {level_counts['1']} / 2级 {level_counts['2']} / "
         f"3级 {level_counts['3']} / 失败 {level_counts['miss']}, "
+        f"类型白名单丢弃 {type_stats.dropped} 条（{type_stats.per_type}）, "
         f"置信度丢弃 {conf_stats.dropped_low_confidence} / 待复核 {conf_stats.needs_review} 条, "
         f"聚类合并 {cluster_stats.merged} 条（{cluster_stats.clusters} 组）, "
         f"后处理合并 {stats.merged_duplicates} / 低severity {stats.dropped_severity} / "
